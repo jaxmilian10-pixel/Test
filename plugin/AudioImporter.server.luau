@@ -1,7 +1,10 @@
 local ServerStorage = game:GetService("ServerStorage")
+local ContentProvider = game:GetService("ContentProvider")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local VALIDATE_TIMEOUT = 15
 local MAX_CONCURRENT = 8
+local AUDIO_ASSET_TYPE = Enum.AssetType.Audio.Value
 
 local function GetOrCreateFolder(parent, name)
 	local folder = parent:FindFirstChild(name)
@@ -39,28 +42,63 @@ Main.Parent = Widget
 
 local Status = Main.Status
 local Actions = Main.Actions
-local Input = Main.Input2
 
--- A entrada por ID foi removida; esconde a caixa antiga se ela ainda existir na UI.
-local LegacyInput = Main:FindFirstChild("Input")
-if LegacyInput then
-	LegacyInput.Visible = false
-end
+-- Input: lista de IDs no formato "id,id,id" (também aceita espaços, ";", quebras de linha e rbxassetid://).
+-- Input2: texto copiado do Gerenciador de Ativos (Nome, ID, Tipo, Modificado, Criador).
+local IdInput = Main:FindFirstChild("Input")
+local InfoInput = Main:FindFirstChild("Input2")
 
 local AddedCount = 0
 local InvalidCount = 0
+local SkippedCount = 0
 
-local Processing = {}
-local Running = 0
+local Queue = {}
+local Queued = {}
+local ActiveWorkers = 0
+
+local function SetLabel(name, text)
+	local label = Status:FindFirstChild(name)
+
+	if label then
+		label.Text = text
+	end
+end
 
 local function UpdateStatus()
-	Status.Total.Text = ("Total: %d"):format(#Storage:GetChildren())
-	Status.Added.Text = ("Added: %d"):format(AddedCount)
-	Status.Invalid.Text = ("Invalid: %d"):format(InvalidCount)
+	SetLabel("Total", ("Total: %d"):format(#Storage:GetChildren()))
+	SetLabel("Added", ("Added: %d"):format(AddedCount))
+	SetLabel("Invalid", ("Invalid: %d"):format(InvalidCount))
+	SetLabel("Skipped", ("Skipped: %d"):format(SkippedCount))
+	SetLabel("Pending", ("Pending: %d"):format(#Queue + ActiveWorkers))
 end
 
 local function Trim(text)
 	return text:match("^%s*(.-)%s*$")
+end
+
+--------------------------------------------------------------------------------
+-- Parsing
+--------------------------------------------------------------------------------
+
+-- Aceita "123,456, 789", um por linha, separados por ";" ou espaço,
+-- e também "rbxassetid://123" ou links da Creator Store.
+local function ParseIdList(text)
+	local entries = {}
+	local seen = {}
+	local rejected = {}
+
+	for token in text:gmatch("[^,;%s]+") do
+		local id = tonumber(token:match("%d+"))
+
+		if not id or id <= 0 then
+			table.insert(rejected, token)
+		elseif not seen[id] then
+			seen[id] = true
+			table.insert(entries, { Id = id })
+		end
+	end
+
+	return entries, rejected
 end
 
 -- Divide uma linha CSV respeitando campos entre aspas ("Nome, com vírgula").
@@ -109,7 +147,7 @@ end
 -- Formato esperado: Nome, ID do ativo, Tipo, Modificado, Criador.
 -- Se o nome ou o criador tiverem vírgulas sem aspas, localiza a coluna do ID
 -- procurando um número seguido do tipo "Audio".
-local function ParseLine(line)
+local function ParseInfoLine(line)
 	local fields = SplitCsvLine(line)
 
 	if #fields < 5 then
@@ -134,9 +172,8 @@ local function ParseLine(line)
 	end
 
 	local assetId = tonumber(fields[idIndex])
-	local assetType = fields[idIndex + 1]
 
-	if not assetId or not IsAudioType(assetType) then
+	if not assetId or not IsAudioType(fields[idIndex + 1]) then
 		return
 	end
 
@@ -148,20 +185,49 @@ local function ParseLine(line)
 	}
 end
 
-local function ParseAssetManagerText(text)
+local function ParseInfoText(text)
 	local entries = {}
 	local seen = {}
+	local rejected = {}
 
 	for line in text:gmatch("[^\r\n]+") do
-		local entry = ParseLine(line)
+		if Trim(line) ~= "" then
+			local entry = ParseInfoLine(line)
 
-		if entry and not seen[entry.Id] then
-			seen[entry.Id] = true
-			table.insert(entries, entry)
+			if not entry then
+				table.insert(rejected, line)
+			elseif not seen[entry.Id] then
+				seen[entry.Id] = true
+				table.insert(entries, entry)
+			end
 		end
 	end
 
-	return entries
+	return entries, rejected
+end
+
+--------------------------------------------------------------------------------
+-- Validação
+--------------------------------------------------------------------------------
+
+-- Preenche Nome/Criador/Modificado pela API quando a entrada só tem o ID.
+-- Retorna false se o ativo existe mas não é um áudio.
+local function FillInfo(entry)
+	local ok, info = pcall(MarketplaceService.GetProductInfo, MarketplaceService, entry.Id, Enum.InfoType.Asset)
+
+	if not ok or type(info) ~= "table" then
+		return true
+	end
+
+	if info.AssetTypeId and info.AssetTypeId ~= AUDIO_ASSET_TYPE then
+		return false
+	end
+
+	entry.Name = entry.Name or info.Name
+	entry.Modified = entry.Modified or info.Updated or info.Created
+	entry.Creator = entry.Creator or (info.Creator and info.Creator.Name)
+
+	return true
 end
 
 local function ValidateAudio(id)
@@ -170,13 +236,21 @@ local function ValidateAudio(id)
 	sound.Volume = 0
 	sound.Parent = TempStorage
 
-	pcall(function()
-		sound:Play()
+	local failed = false
+
+	task.spawn(function()
+		pcall(ContentProvider.PreloadAsync, ContentProvider, { sound }, function(_, fetchStatus)
+			if fetchStatus == Enum.AssetFetchStatus.Failure then
+				failed = true
+			end
+		end)
 	end)
+
+	pcall(sound.Play, sound)
 
 	local deadline = os.clock() + VALIDATE_TIMEOUT
 
-	while sound.TimeLength <= 0 and os.clock() < deadline do
+	while sound.TimeLength <= 0 and not failed and os.clock() < deadline do
 		task.wait()
 	end
 
@@ -187,96 +261,164 @@ local function ValidateAudio(id)
 	return valid
 end
 
+--------------------------------------------------------------------------------
+-- Importação
+--------------------------------------------------------------------------------
+
 local function CreateAudioFolder(entry)
 	local folder = Instance.new("Folder")
 	folder.Name = tostring(entry.Id)
 
-	folder:SetAttribute("Name", entry.Name)
-	folder:SetAttribute("Created", entry.Modified)
-	folder:SetAttribute("Creator", entry.Creator)
+	folder:SetAttribute("Name", entry.Name or "")
+	folder:SetAttribute("Created", entry.Modified or "")
+	folder:SetAttribute("Creator", entry.Creator or "")
 
 	folder.Parent = Storage
 
 	return folder
 end
 
-local function ProcessEntry(entry)
-	local id = entry.Id
+local function MarkInvalid(entry, reason)
+	InvalidCount += 1
+	warn(("[Inválido] %d %s (%s)"):format(entry.Id, entry.Name or "", reason))
+end
 
-	if Processing[id] or Storage:FindFirstChild(tostring(id)) then
+local function ProcessEntry(entry)
+	if Storage:FindFirstChild(tostring(entry.Id)) then
+		SkippedCount += 1
 		return
 	end
 
-	Processing[id] = true
-
-	while Running >= MAX_CONCURRENT do
-		task.wait()
+	if not entry.Name and not FillInfo(entry) then
+		MarkInvalid(entry, "não é um áudio")
+		return
 	end
 
-	Running += 1
+	if not ValidateAudio(entry.Id) then
+		MarkInvalid(entry, "não carregou")
+		return
+	end
 
-	local success, err = pcall(function()
-		if not ValidateAudio(id) then
+	-- Outro processo pode ter criado a pasta enquanto validávamos.
+	if Storage:FindFirstChild(tostring(entry.Id)) then
+		SkippedCount += 1
+		return
+	end
+
+	CreateAudioFolder(entry)
+	AddedCount += 1
+	print("[Importado]", entry.Id, entry.Name)
+end
+
+local function Worker()
+	ActiveWorkers += 1
+
+	while #Queue > 0 do
+		local entry = table.remove(Queue, 1)
+		local ok, err = pcall(ProcessEntry, entry)
+
+		if not ok then
 			InvalidCount += 1
-			UpdateStatus()
-			warn("[Inválido]", id, entry.Name)
-			return
+			warn("[Erro]", entry.Id, err)
 		end
 
-		CreateAudioFolder(entry)
-		print("[Importado]", id, entry.Name)
-	end)
-
-	if not success then
-		warn("[Erro]", id, err)
+		Queued[entry.Id] = nil
+		UpdateStatus()
 	end
 
-	Running -= 1
-	Processing[id] = nil
+	ActiveWorkers -= 1
+	UpdateStatus()
 end
 
-local function OnInputFocusLost(enterPressed)
-	if not enterPressed then
-		return
-	end
-
-	local entries = ParseAssetManagerText(Input.Text)
-
-	if #entries == 0 then
-		warn("Nenhum áudio encontrado no texto informado.")
-		return
-	end
+local function Enqueue(entries)
+	local count = 0
 
 	for _, entry in entries do
-		task.spawn(ProcessEntry, entry)
+		if Queued[entry.Id] or Storage:FindFirstChild(tostring(entry.Id)) then
+			SkippedCount += 1
+		else
+			Queued[entry.Id] = true
+			table.insert(Queue, entry)
+			count += 1
+		end
 	end
 
-	Input.Text = ""
+	while ActiveWorkers < MAX_CONCURRENT and #Queue > 0 do
+		task.spawn(Worker)
+	end
+
+	UpdateStatus()
+
+	return count
 end
 
-local function RefreshCounters()
+local function Submit(textBox, parser, label)
+	local text = textBox.Text
+
+	if Trim(text) == "" then
+		return
+	end
+
+	local entries, rejected = parser(text)
+
+	for _, value in rejected do
+		warn(("[%s] Ignorado: %s"):format(label, value))
+	end
+
+	if #entries == 0 then
+		warn(("[%s] Nenhum áudio encontrado no texto informado."):format(label))
+		return
+	end
+
+	local count = Enqueue(entries)
+	print(("[%s] %d na fila, %d já existentes/duplicados."):format(label, count, #entries - count))
+
+	textBox.Text = ""
+end
+
+local function ResetCounters()
 	AddedCount = 0
 	InvalidCount = 0
+	SkippedCount = 0
 	UpdateStatus()
 end
 
-local function ToggleWidget()
-	Widget.Enabled = not Widget.Enabled
+--------------------------------------------------------------------------------
+-- Conexões
+--------------------------------------------------------------------------------
+
+if IdInput then
+	IdInput.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			Submit(IdInput, ParseIdList, "IDs")
+		end
+	end)
 end
 
-Storage.ChildAdded:Connect(function()
-	AddedCount += 1
-	UpdateStatus()
-end)
+if InfoInput then
+	InfoInput.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			Submit(InfoInput, ParseInfoText, "Info")
+		end
+	end)
+end
 
+Storage.ChildAdded:Connect(UpdateStatus)
 Storage.ChildRemoved:Connect(UpdateStatus)
 
 Widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	OpenButton:SetActive(Widget.Enabled)
 end)
 
-Actions.Refresh.MouseButton1Click:Connect(RefreshCounters)
-OpenButton.Click:Connect(ToggleWidget)
-Input.FocusLost:Connect(OnInputFocusLost)
+Actions.Refresh.MouseButton1Click:Connect(ResetCounters)
+
+OpenButton.Click:Connect(function()
+	Widget.Enabled = not Widget.Enabled
+end)
+
+plugin.Unloading:Connect(function()
+	table.clear(Queue)
+	TempStorage:ClearAllChildren()
+end)
 
 UpdateStatus()
